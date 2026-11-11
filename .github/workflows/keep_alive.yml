@@ -1,0 +1,65 @@
+name: Keep Streamlit MCP Bridge Awake
+
+on:
+  schedule:
+    # Runs every 6 hours (well inside Streamlit's 12-hour sleep window)
+    - cron: "0 */6 * * *"
+  workflow_dispatch: # Lets you trigger a test run manually
+
+env:
+  APP_URL: "https://xiaozhi-tuya-mcp-zamankazuya.streamlit.app"
+
+jobs:
+  wake:
+    runs-on: ubuntu-latest
+    steps:
+      - name: 1. Call Streamlit Resume API
+        run: |
+          # Fetch CSRF token and cookie, then POST to /api/v2/app/resume
+          HEADERS=$(mktemp)
+          COOKIES=$(mktemp)
+          curl -s -D "$HEADERS" -c "$COOKIES" "$APP_URL/api/v2/app/status" > /dev/null
+          CSRF=$(grep -i "^x-csrf-token:" "$HEADERS" | awk '{print $2}' | tr -d '\r')
+          UUID=$(cat /proc/sys/kernel/random/uuid)
+          if [ -n "$CSRF" ]; then
+            STATUS=$(curl -s -o /dev/null -w "%{http_code}" -X POST "$APP_URL/api/v2/app/resume" \
+              -b "$COOKIES" \
+              -H "x-csrf-token: $CSRF" \
+              -H "x-streamlit-machine-id: $UUID" \
+              -H "origin: $APP_URL" \
+              -H "referer: $APP_URL/")
+            echo "Resume API returned HTTP $STATUS"
+          fi
+
+      - name: 2. Set up Python & Playwright
+        uses: actions/setup-python@v5
+        with:
+          python-version: "3.11"
+
+      - name: 3. Open WebSocket Session & Click Wake Button if Needed
+        run: |
+          pip install playwright
+          playwright install chromium
+          python3 - << 'EOF'
+          import os
+          from playwright.sync_api import sync_playwright
+
+          url = os.environ["APP_URL"]
+          with sync_playwright() as p:
+              browser = p.chromium.launch(headless=True)
+              page = browser.new_page()
+              print(f"Visiting {url}...")
+              page.goto(url, wait_until="networkidle", timeout=60000)
+              page.wait_for_timeout(5000)
+
+              # If the app hibernated, click the wake-up button
+              wake_btn = page.get_by_role("button", name="Yes, get this app back up!")
+              if wake_btn.is_visible():
+                  print("App was sleeping — clicking wake button...")
+                  wake_btn.click()
+                  page.wait_for_timeout(25000)
+              else:
+                  print("App is already awake and WebSocket session refreshed!")
+
+              browser.close()
+          EOF
